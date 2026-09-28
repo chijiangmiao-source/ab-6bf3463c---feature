@@ -12,8 +12,10 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.solver import (
+    CANCEL_STRIDE,
     MAX_CHECKS,
     MAX_CHANNELS,
+    CancelledError,
     ValidationError,
     recompute,
     solve,
@@ -254,6 +256,76 @@ class SolverTests(unittest.TestCase):
         self.assertTrue(r.feasible)
         self.assertEqual(r.weight, 3)
         self.assertEqual(r.faulty, ("x1", "x3", "x7"))
+
+    # ---- 确定检查点取消 ----
+    def _big_input(self):
+        # 36 通道单条校验：左半 2^18 枚举有 64 个检查点（步长 4096）。
+        channels = [f"PX{j:02d}" for j in range(MAX_CHANNELS)]
+        checks = [(list(channels), 1)]
+        return channels, checks
+
+    def test_cancel_during_left_enumeration(self):
+        channels, checks = self._big_input()
+        calls = 0
+
+        def cancel_check():
+            nonlocal calls
+            calls += 1
+            if calls == 3:  # 第 3 个确定检查点：尚在左半折半枚举
+                raise CancelledError()
+
+        with self.assertRaises(CancelledError):
+            solve(channels, checks, cancel_check=cancel_check)
+        self.assertLessEqual(calls, 2 ** (len(channels) // 2) // CANCEL_STRIDE + 1)
+
+    def test_cancel_during_right_merge(self):
+        channels, checks = self._big_input()
+        phase = {"p": "left"}
+
+        def on_progress(p, percent):
+            phase["p"] = p
+
+        def cancel_check():
+            # 放行整个左半枚举，进入右侧候选合并后的首个检查点取消。
+            if phase["p"] == "right":
+                raise CancelledError()
+
+        with self.assertRaises(CancelledError):
+            solve(channels, checks, cancel_check=cancel_check,
+                  progress=on_progress)
+
+    def test_progress_checkpoints_deterministic(self):
+        channels, checks = self._big_input()
+        seen = []
+
+        def on_progress(p, percent):
+            seen.append((p, percent))
+
+        r = solve(channels, checks, progress=on_progress)
+        self.assertTrue(r.feasible)
+        phases = [p for p, _ in seen]
+        self.assertIn("left", phases)
+        self.assertIn("right", phases)
+        # 同阶段内百分比单调不减，且取值在 0..100。
+        for p in ("left", "right"):
+            vals = [pct for ph, pct in seen if ph == p]
+            self.assertTrue(all(0 <= v <= 100 for v in vals))
+            self.assertEqual(vals, sorted(vals))
+        left_vals = [pct for ph, pct in seen if ph == "left"]
+        right_vals = [pct for ph, pct in seen if ph == "right"]
+        self.assertLess(left_vals[0], 10)    # 折半枚举起点约为 0
+        self.assertGreaterEqual(right_vals[0], 50)  # 右侧合并从约 50% 开始
+        self.assertLess(right_vals[0], 60)
+
+    def test_no_callbacks_solves_normally(self):
+        channels, checks = self._big_input()
+        r = solve(channels, checks)
+        self.assertTrue(r.feasible)
+        rows = [(tuple(m), p) for m, p in checks]
+        self.assertTrue(
+            all(row["pass"] for row in recompute(
+                list(r.channels), rows, list(r.vector)))
+        )
 
 
 if __name__ == "__main__":

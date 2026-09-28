@@ -50,6 +50,15 @@ class ValidationError(ValueError):
         super().__init__("; ".join(f"{f}: {msg}" for f, msg in errors))
 
 
+class CancelledError(Exception):
+    """求解在确定检查点观察到取消请求，立即放弃计算。"""
+
+
+# 取消/进度检查点步长：左半枚举与右侧每层合并每经过该数量的
+# 部分向量即检查一次取消标志（确定位置，与输入规模无关）。
+CANCEL_STRIDE = 4096
+
+
 @dataclass(frozen=True)
 class SolveResult:
     feasible: bool
@@ -61,8 +70,12 @@ class SolveResult:
     left_index_size: int               # 左半综合征索引条目数
 
 
-def _validate(channels, checks):
-    """校验原始输入，返回 (有序通道列表, [(通道集合元组, 奇偶值)])。"""
+def validate_input(channels, checks):
+    """校验原始输入，返回 (有序通道列表, [(通道集合元组, 奇偶值)])。
+
+    在求解开始前调用一次即可“冻结”排序通道与校验集合；非法输入
+    抛出 ValidationError，errors 中每条都是可定位的 (field, message)。
+    """
     errors: list[tuple[str, str]] = []
 
     # ---- 通道 ----
@@ -200,12 +213,19 @@ def _combinations_by_weight(width: int, weight: int):
     yield from gen(0)
 
 
-def solve(channels, checks) -> SolveResult:
+def solve(channels, checks, cancel_check=None, progress=None) -> SolveResult:
     """
     求最小汉明重量可行故障向量；同重量按选择向量（通道标识升序）
     字典序最小裁决。无可行解释时返回 feasible=False。
+
+    cancel_check：可选可调用对象，在确定检查点（左半枚举与右侧
+    合并每 CANCEL_STRIDE 个部分向量、以及每个重量层边界）被调用；
+    其应抛出 CancelledError 以放弃求解。
+    progress：可选回调 progress(phase, percent)，phase 为
+    "left" / "right"，percent 为 0–100 的整数，在同一批确定
+    检查点上报。
     """
-    ordered_channels, norm_checks = _validate(channels, checks)
+    ordered_channels, norm_checks = validate_input(channels, checks)
     rows = _build_rows(ordered_channels, norm_checks)
     n = len(ordered_channels)
     m = len(rows)
@@ -245,7 +265,14 @@ def solve(channels, checks) -> SolveResult:
     # ------------------------------------------------------------------
     # index: syndrome -> (weight, vec, lex_key)
     index: dict[int, tuple[int, int, int]] = {}
-    for vec in range(1 << l):
+    total_left = 1 << l
+    for vec in range(total_left):
+        # 确定检查点：每 CANCEL_STRIDE 个左半部分向量一次。
+        if (vec & (CANCEL_STRIDE - 1)) == 0:
+            if cancel_check is not None:
+                cancel_check()
+            if progress is not None:
+                progress("left", vec * 50 // total_left)
         s = syndrome(vec, left_masks)
         w = vec.bit_count()
         key = _reverse_bits(vec, l)
@@ -262,11 +289,19 @@ def solve(channels, checks) -> SolveResult:
     best_key = -1
 
     for wR in range(r + 1):
+        # 确定检查点：每个重量层边界一次。
+        if cancel_check is not None:
+            cancel_check()
+        if progress is not None:
+            progress("right", 50 + wR * 50 // (r + 1))
         # wL 最小为 0；只有 wR 严格大于已知最优总重量时该层才无机会。
         # wR == best_weight 的层仍可能由 wL=0 给出同重量、字典序更小的解。
         if wR > best_weight:
             break
-        for vecR in _combinations_by_weight(r, wR):
+        for k, vecR in enumerate(_combinations_by_weight(r, wR)):
+            # 确定检查点：层内每 CANCEL_STRIDE 个右半部分向量一次。
+            if k and (k & (CANCEL_STRIDE - 1)) == 0 and cancel_check is not None:
+                cancel_check()
             sR = syndrome(vecR, right_masks)
             need = (target ^ sR) & full_mask
             kept = index.get(need)

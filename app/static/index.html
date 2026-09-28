@@ -67,6 +67,22 @@
   }
   .meta { color: var(--muted); font-size: 12px; margin-top: 10px; }
   .hidden { display: none; }
+  /* 请求状态区：计算中 / 已取消 / 已完成 / 失败 */
+  #statusPanel h2 { font-size: 15px; }
+  #statusPanel.computing h2 { color: var(--accent); }
+  #statusPanel.cancelled h2 { color: var(--warn); }
+  #statusPanel.done h2 { color: var(--ok); }
+  #statusPanel.failed h2 { color: var(--bad); }
+  .progress-track {
+    width: 100%; height: 8px; background: #0d1319;
+    border: 1px solid var(--line); border-radius: 99px; margin: 10px 0 6px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%; width: 0; background: var(--accent);
+    border-radius: 99px; transition: width .25s ease;
+  }
+  .req-id { font-family: ui-monospace, monospace; color: var(--accent); }
 </style>
 </head>
 <body>
@@ -86,14 +102,21 @@
 
     <div>
       <button type="button" id="submitBtn">提交求解</button>
+      <button type="button" class="secondary hidden" id="cancelBtn">取消本次复核</button>
       <button type="button" class="secondary" id="sampleBtn">填入示例</button>
     </div>
-    <p class="hint">提交成功后将获得复核编号；刷新页面后可用编号取回故障通道与逐校验复算。输入非法或不可满足时，当前编辑内容会被保留。</p>
+    <p class="hint">提交成功后将获得请求标识与（稍后的）复核编号；结果返回前可取消并在同页立即提交另一份观测——新请求只显示自身进度与结论。
+      相同标识与输入的网络重传会取回同一请求状态；刷新页面后可用复核编号取回故障通道与逐校验复算。输入非法时编辑内容会被保留。</p>
   </section>
 
   <section class="panel hidden" id="errors">
-    <h2 style="color:var(--bad)">输入被拒绝（未保存记录，编辑内容已保留）</h2>
+    <h2 style="color:var(--bad)">输入被拒绝（未保存记录，编辑内容永不清空）</h2>
     <div id="errorList"></div>
+  </section>
+
+  <section class="panel hidden" id="statusPanel">
+    <h2 id="statusTitle"></h2>
+    <div id="statusBody"></div>
   </section>
 
   <section class="panel">

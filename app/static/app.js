@@ -50,6 +50,17 @@ function collectPayload() {
 const resultBox = document.getElementById("result");
 const errorBox = document.getElementById("errors");
 const errorList = document.getElementById("errorList");
+const statusPanel = document.getElementById("statusPanel");
+const statusTitle = document.getElementById("statusTitle");
+const statusBody = document.getElementById("statusBody");
+const submitBtn = document.getElementById("submitBtn");
+const cancelBtn = document.getElementById("cancelBtn");
+
+// 当前页面会话：只有最新一次提交的轮询令牌允许改写页面，
+// 旧请求即使稍后结束也不得覆盖新请求的展示。
+let sessionToken = 0;
+let currentRequestId = null;
+let pollTimer = null;
 
 function clearEvidence() {
   // 任何新的提交/取回尝试前，清除上一次的结论与告警，
@@ -57,6 +68,8 @@ function clearEvidence() {
   resultBox.innerHTML = "";
   errorBox.classList.add("hidden");
   errorList.innerHTML = "";
+  statusPanel.classList.add("hidden");
+  statusBody.innerHTML = "";
 }
 
 function showErrors(payload) {
@@ -131,10 +144,134 @@ function renderConclusion(data) {
   resultBox.innerHTML = html;
 }
 
+// ---------- 请求状态 ----------
+function setButtonsRunning(running) {
+  submitBtn.disabled = running;
+  submitBtn.textContent = running ? "求解中…" : "提交求解";
+  cancelBtn.classList.toggle("hidden", !running);
+}
+
+function escStatus(s) {
+  return ({
+    pending: "排队中", running: "计算中", done: "已完成",
+    cancelled: "已取消", failed: "求解失败",
+  })[s] || s;
+}
+
+function renderStatus(data, token) {
+  if (token !== sessionToken) return;  // 旧请求不得覆盖页面
+  statusPanel.classList.remove("hidden");
+  statusPanel.classList.remove("computing", "cancelled", "done", "failed");
+  const st = data.status;
+  let title = `请求 ${escStatus(st)}`;
+  if (st === "pending" || st === "running") {
+    title = st === "pending" ? "请求已排队" : "计算中（可取消）";
+    statusPanel.classList.add("computing");
+  } else if (st === "cancelled") {
+    statusPanel.classList.add("cancelled");
+  } else if (st === "done") {
+    statusPanel.classList.add("done");
+  } else {
+    statusPanel.classList.add("failed");
+  }
+  statusTitle.textContent = title;
+
+  const pct = data.progress && typeof data.progress.percent === "number"
+    ? data.progress.percent : 0;
+  const phase = data.progress && data.progress.phase === "right"
+    ? "左右候选合并" : "折半枚举";
+  let html = `<p class="meta">请求标识：<span class="req-id">${esc(data.request_id)}</span>`;
+  if (data.review_id) {
+    html += `　复核编号：<span class="review-id">${esc(data.review_id)}</span>`;
+  }
+  html += "</p>";
+  if (st === "pending" || st === "running") {
+    html += `<div class="progress-track"><div class="progress-fill"
+                 style="width:${st === "pending" ? 0 : Math.max(pct, 2)}%"></div></div>
+             <p class="meta">${phase}（约 ${st === "pending" ? 0 : pct}%）；
+             取消后不生成复核编号，可在同页立即提交另一份观测。</p>`;
+  } else if (st === "cancelled") {
+    html += `<p class="meta">该次复核已在折半枚举/候选合并的确定检查点响应取消，
+             未生成复核编号，结论未写入复核记录。</p>`;
+  } else if (st === "failed") {
+    html += `<p class="meta">求解过程异常终止，请核对输入后重新提交。</p>`;
+  } else {
+    html += `<p class="meta">计算完成，结论如下（刷新页面后可凭复核编号取回）。</p>`;
+  }
+  statusBody.innerHTML = html;
+
+  if (st === "done") {
+    renderConclusion(data);
+  } else {
+    resultBox.innerHTML = "";
+  }
+}
+
+async function pollRequest(requestId, token) {
+  let data;
+  try {
+    const resp = await fetch("/api/request/" + encodeURIComponent(requestId));
+    data = await resp.json().catch(() => null);
+    if (!resp.ok) throw new Error("状态查询失败");
+  } catch (err) {
+    if (token === sessionToken) {
+      pollTimer = setTimeout(() => pollRequest(requestId, token), 1000);
+    }
+    return;
+  }
+  if (token !== sessionToken) return;  // 已被取消后重提或新提交取代
+  renderStatus(data, token);
+  if (data.status === "pending" || data.status === "running") {
+    pollTimer = setTimeout(() => pollRequest(requestId, token), 400);
+  } else {
+    setButtonsRunning(false);
+    pollTimer = null;
+  }
+}
+
+async function startRequest(payload) {
+  // 旧会话作废：任何迟到的旧请求回调都不得再改写页面。
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  const token = ++sessionToken;
+  currentRequestId = null;
+  setButtonsRunning(true);
+  clearEvidence();
+  let data;
+  try {
+    const resp = await fetch("/api/submit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    data = await resp.json().catch(() => null);
+    if (!resp.ok) throw { status: resp.status, data };
+  } catch (err) {
+    if (token !== sessionToken) return;
+    setButtonsRunning(false);
+    showErrors((err && err.data) || {
+      errors: [{ field: "network", message: `请求失败: ${err}` }],
+    });
+    return;
+  }
+  if (token !== sessionToken) return;
+  currentRequestId = data.request_id;
+  if (data.status === "pending" || data.status === "running") {
+    renderStatus(data, token);
+    pollRequest(data.request_id, token);
+  } else {
+    // 相同输入重传：直接返回既有终态。
+    renderStatus(data, token);
+    setButtonsRunning(false);
+    if (data.status === "done" && data.review_id) {
+      history.replaceState(null, "", "#" + data.review_id);
+      document.getElementById("reviewId").value = data.review_id;
+    }
+  }
+}
+
 // ---------- 提交 ----------
 document.getElementById("addCheck").addEventListener("click", () => addCheckRow());
-document.getElementById("submitBtn").addEventListener("click", async () => {
-  clearEvidence();
+document.getElementById("submitBtn").addEventListener("click", () => {
   let payload;
   try {
     payload = collectPayload();
@@ -142,34 +279,44 @@ document.getElementById("submitBtn").addEventListener("click", async () => {
     showErrors({ errors: [{ field: "form", message: String(err) }] });
     return;
   }
-  let resp;
+  startRequest(payload);
+});
+
+// ---------- 取消 ----------
+cancelBtn.addEventListener("click", async () => {
+  const requestId = currentRequestId;
+  if (!requestId) return;
+  cancelBtn.disabled = true;
   try {
-    resp = await fetch("/api/submit", {
+    const resp = await fetch("/api/cancel", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ request_id: requestId }),
     });
-  } catch (err) {
-    showErrors({ errors: [{ field: "network", message: `请求失败: ${err}` }] });
-    return;
+    const data = await resp.json().catch(() => null);
+    if (resp.ok) {
+      renderStatus(data, sessionToken);
+      // 取消已持久化裁决（可能稍早/稍晚于完成）：恢复提交按钮，
+      // 允许在同页立即提交另一份观测；终态由在途轮询最终确认。
+      if (data.status === "cancelled") setButtonsRunning(false);
+    }
+  } finally {
+    cancelBtn.disabled = false;
   }
-  const data = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    showErrors(data);
-    return;
-  }
-  // 合法提交（含不可行结论）：写入编号到地址栏，刷新后可直接取回。
-  history.replaceState(null, "", "#" + data.review_id);
-  document.getElementById("reviewId").value = data.review_id;
-  renderConclusion(data);
 });
 
 // ---------- 按编号取回 ----------
 async function loadReview(id) {
+  // 取回动作接管页面会话：迟到的旧轮询不得覆盖取回的记录。
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  const token = ++sessionToken;
+  currentRequestId = null;
+  setButtonsRunning(false);
   clearEvidence();
   document.getElementById("reviewId").value = id;
   const resp = await fetch("/api/review/" + encodeURIComponent(id));
   const data = await resp.json().catch(() => null);
+  if (token !== sessionToken) return;
   if (!resp.ok) {
     showErrors(data || { errors: [{ field: "review_id", message: "取回失败" }] });
     return;
