@@ -5,6 +5,9 @@ services:
     environment:
       APP_PORT: "8080"
       APP_DB: /data/locator.db
+      # 每个确定检查点的停顿：仅作用于折半枚举/候选合并的检查点，
+      # 为大板观测提供确定可观测的取消窗口（小输入至多停顿一次）。
+      APP_CHECKPOINT_DELAY: "0.02"
     ports:
       # 宿主机端口可用环境变量 APP_PORT 更改：
       #   APP_PORT=9090 docker compose up app

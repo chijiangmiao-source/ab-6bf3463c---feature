@@ -14,9 +14,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from app.solver import (
     MAX_CHECKS,
     MAX_CHANNELS,
+    PHASE_LEFT,
+    PHASE_RIGHT,
+    SolveCancelled,
     ValidationError,
+    prepare,
     recompute,
     solve,
+    solve_frozen,
 )
 
 
@@ -254,6 +259,118 @@ class SolverTests(unittest.TestCase):
         self.assertTrue(r.feasible)
         self.assertEqual(r.weight, 3)
         self.assertEqual(r.faulty, ("x1", "x3", "x7"))
+
+    # ---- 取消检查点与冻结输入 ----
+    def test_prepare_freezes_sorted_input(self):
+        frozen = prepare(["c", "a", "b"], [
+            (["b", "a"], 1), (["c"], 0)])
+        self.assertEqual(frozen.channels, ("a", "b", "c"))
+        # 校验成员已排序；重复求解得到完全一致的冻结结果（可重放）。
+        again = prepare(["b", "c", "a"], [(["a", "b"], 1), (["c"], 0)])
+        self.assertEqual(again.checks, frozen.checks)
+        self.assertEqual(again.target, frozen.target)
+        self.assertEqual(again.left_masks, frozen.left_masks)
+        r = solve_frozen(frozen)
+        self.assertTrue(r.feasible)
+        # a⊕b=1, c=0 的最小重量解为仅 b 失效。
+        self.assertEqual(r.faulty, ("b",))
+
+    def test_cancel_at_left_enumeration_checkpoint(self):
+        # 36 通道：左半 2^18 枚举，在首个检查点即取消。
+        rng = random.Random(7)
+        channels = [f"PX{j:02d}" for j in range(MAX_CHANNELS)]
+        checks = []
+        seen = set()
+        while len(checks) < MAX_CHECKS:
+            k = rng.randint(2, 10)
+            members = tuple(sorted(rng.sample(channels, k)))
+            if members in seen:
+                continue
+            seen.add(members)
+            checks.append((list(members), rng.randint(0, 1)))
+        frozen = prepare(channels, checks)
+
+        events = []
+
+        def progress(phase, done, total):
+            events.append((phase, done, total))
+
+        with self.assertRaises(SolveCancelled) as ctx:
+            solve_frozen(frozen, is_cancelled=lambda: True,
+                         progress=progress)
+        self.assertEqual(ctx.exception.phase, PHASE_LEFT)
+        # 取消前至少经过一个检查点（进度先于取消判定回调）。
+        self.assertTrue(events)
+        self.assertEqual(events[0][0], PHASE_LEFT)
+
+    def test_cancel_only_observed_at_checkpoints(self):
+        # 小输入（l=3，左半仅 8 个向量 < 检查点步长）：
+        # 取消在折半枚举尾检查点即被响应，结果不产出。
+        channels = ["a", "b", "c", "d", "e", "f"]
+        checks = [
+            (["a", "c", "e"], 1),
+            (["b", "d", "f"], 0),
+            (["a", "b", "c"], 1),
+        ]
+        frozen = prepare(channels, checks)
+        phases = []
+        with self.assertRaises(SolveCancelled) as ctx:
+            solve_frozen(
+                frozen,
+                is_cancelled=lambda: True,
+                progress=lambda phase, d, t: phases.append(phase),
+            )
+        self.assertIn(ctx.exception.phase, (PHASE_LEFT, PHASE_RIGHT))
+        # 取消阶段一定是先记录过进度的确定检查点。
+        self.assertIn(ctx.exception.phase, phases)
+
+    def test_cancel_flag_flips_during_merge(self):
+        # 左半枚举阶段不取消，进入候选合并后于检查点取消。
+        channels = [f"PX{j:02d}" for j in range(MAX_CHANNELS)]
+        rng = random.Random(11)
+        checks, seen = [], set()
+        while len(checks) < MAX_CHECKS:
+            k = rng.randint(2, 10)
+            members = tuple(sorted(rng.sample(channels, k)))
+            if members in seen:
+                continue
+            seen.add(members)
+            checks.append((list(members), rng.randint(0, 1)))
+        frozen = prepare(channels, checks)
+
+        state = {"cancel": False}
+
+        def is_cancelled():
+            return state["cancel"]
+
+        def progress(phase, done, total):
+            if phase == PHASE_RIGHT:
+                state["cancel"] = True
+
+        with self.assertRaises(SolveCancelled) as ctx:
+            solve_frozen(frozen, is_cancelled=is_cancelled,
+                         progress=progress)
+        self.assertEqual(ctx.exception.phase, PHASE_RIGHT)
+
+    def test_no_cancel_matches_plain_solve(self):
+        channels = ["CH0", "CH1", "CH2", "CH3", "CH4", "CH5"]
+        checks = [
+            (["CH0", "CH1", "CH3"], 1),
+            (["CH2", "CH3", "CH4"], 1),
+            (["CH3", "CH5"], 1),
+            (["CH0", "CH2", "CH4"], 0),
+        ]
+        plain = solve(channels, checks)
+        frozen = prepare(channels, checks)
+        seen_progress = []
+        r = solve_frozen(frozen, is_cancelled=lambda: False,
+                         progress=lambda p, d, t: seen_progress.append(p))
+        self.assertEqual(r.faulty, plain.faulty)
+        self.assertEqual(r.weight, plain.weight)
+        self.assertEqual(r.vector, plain.vector)
+        # 两个阶段都经过检查点。
+        self.assertIn(PHASE_LEFT, seen_progress)
+        self.assertIn(PHASE_RIGHT, seen_progress)
 
 
 if __name__ == "__main__":

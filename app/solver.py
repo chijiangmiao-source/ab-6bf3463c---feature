@@ -31,6 +31,12 @@
 
 两侧枚举的都是折半后的 *部分* 向量（总迭代 2^l + 2^r 量级），
 算法从不枚举任何完整 2^n 故障向量，也不使用随机搜索或高斯消元。
+
+取消
+====
+折半枚举（阶段 left_enumeration）与左右候选合并（阶段
+candidate_merge）在固定粒度的确定检查点上先回写持久化进度，
+再读取持久化的取消裁决；取消后不产出任何结论（不生成复核编号）。
 """
 
 from __future__ import annotations
@@ -41,6 +47,14 @@ MIN_CHANNELS = 2
 MAX_CHANNELS = 36
 MAX_CHECKS = 28
 
+# 取消检查点粒度：折半枚举 / 候选合并各自每处理若干个部分向量
+# 响应一次取消，使取消延迟有确定上界且进度回写不会过于频繁。
+LEFT_CHECKPOINT_STEP = 2048
+RIGHT_CHECKPOINT_STEP = 1024
+
+PHASE_LEFT = "left_enumeration"     # 左半折半枚举
+PHASE_RIGHT = "candidate_merge"     # 左右候选合并
+
 
 class ValidationError(ValueError):
     """输入非法；errors 为可定位的拒绝信息列表 (field, message)。"""
@@ -48,6 +62,14 @@ class ValidationError(ValueError):
     def __init__(self, errors: list[tuple[str, str]]):
         self.errors = errors
         super().__init__("; ".join(f"{f}: {msg}" for f, msg in errors))
+
+
+class SolveCancelled(Exception):
+    """求解在确定检查点响应取消；phase 记录取消发生的阶段。"""
+
+    def __init__(self, phase: str):
+        self.phase = phase
+        super().__init__(f"求解在检查点被取消（阶段 {phase}）")
 
 
 @dataclass(frozen=True)
@@ -59,6 +81,26 @@ class SolveResult:
     vector: tuple[int, ...]            # 不可行时为 ()
     left_size: int                     # 折半位置（便于测试/复算展示）
     left_index_size: int               # 左半综合征索引条目数
+
+
+@dataclass(frozen=True)
+class FrozenInput:
+    """开始求解前冻结的输入：已排序通道、规范化校验与预计算位掩码。
+
+    一旦构造完成，后续取消/重传/并发都不会再改变排序通道或校验；
+    输入摘要也基于该规范化内容计算。
+    """
+
+    channels: tuple[str, ...]
+    checks: tuple[tuple[tuple[str, ...], int], ...]
+    rows: tuple[tuple[int, int], ...]
+    target: int
+    n: int
+    m: int
+    l: int
+    left_masks: tuple[int, ...]
+    right_masks: tuple[int, ...]
+    full_mask: int
 
 
 def _validate(channels, checks):
@@ -99,7 +141,7 @@ def _validate(channels, checks):
     if not checks:
         errors.append(("checks", "至少需要 1 条校验"))
     if len(checks) > MAX_CHECKS:
-        errors.append(("checks", f"校验数量不得超过 {MAX_CHECKS}，当前 {len(checks)}"))
+        errors.append(("checks", f"校验数量不得超过 {MAX_CHECKS} 条，当前 {len(checks)}"))
 
     norm_checks: list[tuple[tuple[str, ...], int]] = []
     seen_sets: set[frozenset[str]] = set()
@@ -167,6 +209,48 @@ def _build_rows(ordered_channels, checks):
     return rows
 
 
+def prepare(channels, checks) -> FrozenInput:
+    """校验并冻结输入（排序通道、规范化校验、预计算综合征掩码）。
+
+    必须在开始求解前调用：取消/重传/并发过程中排序通道与校验集合
+    不再变化；输入摘要也基于此处的规范化结果。
+    """
+    ordered_channels, norm_checks = _validate(channels, checks)
+    norm_checks_t = tuple((tuple(sorted(members)), parity)
+                          for members, parity in norm_checks)
+    rows = tuple(_build_rows(ordered_channels, norm_checks_t))
+    n = len(ordered_channels)
+    m = len(rows)
+
+    target = 0
+    for i, (_, parity) in enumerate(rows):
+        target |= parity << i
+
+    l = n // 2
+    left_masks = [0] * l
+    right_masks = [0] * (n - l)
+    for i, (mask, _) in enumerate(rows):
+        for j in range(l):
+            if (mask >> j) & 1:
+                left_masks[j] |= 1 << i
+        for j in range(n - l):
+            if (mask >> (l + j)) & 1:
+                right_masks[j] |= 1 << i
+
+    return FrozenInput(
+        channels=tuple(ordered_channels),
+        checks=norm_checks_t,
+        rows=rows,
+        target=target,
+        n=n,
+        m=m,
+        l=l,
+        left_masks=tuple(left_masks),
+        right_masks=tuple(right_masks),
+        full_mask=(1 << m) - 1,
+    )
+
+
 def _reverse_bits(value: int, width: int) -> int:
     """把 width 位整数位序反转。
 
@@ -200,58 +284,56 @@ def _combinations_by_weight(width: int, weight: int):
     yield from gen(0)
 
 
-def solve(channels, checks) -> SolveResult:
-    """
-    求最小汉明重量可行故障向量；同重量按选择向量（通道标识升序）
-    字典序最小裁决。无可行解释时返回 feasible=False。
-    """
-    ordered_channels, norm_checks = _validate(channels, checks)
-    rows = _build_rows(ordered_channels, norm_checks)
-    n = len(ordered_channels)
-    m = len(rows)
+def _syndrome(vec: int, masks: tuple[int, ...]) -> int:
+    s = 0
+    while vec:
+        low = vec & -vec
+        s ^= masks[low.bit_length() - 1]
+        vec ^= low
+    return s
 
-    # 目标综合征 b：第 i 位为第 i 条校验的观测奇偶值。
-    target = 0
-    for i, (_, parity) in enumerate(rows):
-        target |= parity << i
 
-    l = n // 2                      # 折半：左 l 位，右 n-l 位
+def _checkpoint(phase: str, processed: int, total: int,
+                is_cancelled, progress) -> None:
+    """确定检查点：先持久化进度，再读取持久化的取消裁决。
+
+    任何阶段跳转都只发生在检查点上——折半枚举与左右候选合并的循环
+    主体不会在任意位置中断，因此取消点是可复现、可定位的。
+    """
+    if progress is not None:
+        progress(phase, processed, total)
+    if is_cancelled is not None and is_cancelled():
+        raise SolveCancelled(phase)
+
+
+def solve_frozen(frozen: FrozenInput, is_cancelled=None, progress=None) -> SolveResult:
+    """对已冻结输入执行折半综合征索引 + 两侧候选精确合并。
+
+    is_cancelled() 在每个确定检查点被读取；返回真则抛出
+    SolveCancelled，且不会产出任何结论。progress(phase, done, total)
+    在同一检查点先于取消判定被回调，供持久化进度。
+    """
+    n, m, l = frozen.n, frozen.m, frozen.l
     r = n - l
-
-    # 列掩码：通道 j 的列 = 所有引用该通道的校验行编号集合。
-    # 某半区部分向量的综合征，即其置位通道列掩码的 XOR。
-    left_masks = [0] * l
-    right_masks = [0] * r
-    for i, (mask, _) in enumerate(rows):
-        for j in range(l):
-            if (mask >> j) & 1:
-                left_masks[j] |= 1 << i
-        for j in range(r):
-            if (mask >> (l + j)) & 1:
-                right_masks[j] |= 1 << i
-    full_mask = (1 << m) - 1
-
-    def syndrome(vec: int, masks: list[int]) -> int:
-        s = 0
-        while vec:
-            low = vec & -vec
-            s ^= masks[low.bit_length() - 1]
-            vec ^= low
-        return s
+    target, full_mask = frozen.target, frozen.full_mask
+    left_masks, right_masks = frozen.left_masks, frozen.right_masks
 
     # ------------------------------------------------------------------
     # 步骤 1：左半折半，枚举全部 2^l 个部分向量并建立综合征索引。
     # 每个综合征只保留：重量最小 -> 同重量选择向量字典序最小 的候选。
     # ------------------------------------------------------------------
-    # index: syndrome -> (weight, vec, lex_key)
     index: dict[int, tuple[int, int, int]] = {}
-    for vec in range(1 << l):
-        s = syndrome(vec, left_masks)
+    left_total = 1 << l
+    for vec in range(left_total):
+        if vec % LEFT_CHECKPOINT_STEP == 0:
+            _checkpoint(PHASE_LEFT, vec, left_total, is_cancelled, progress)
+        s = _syndrome(vec, left_masks)
         w = vec.bit_count()
         key = _reverse_bits(vec, l)
         kept = index.get(s)
         if kept is None or w < kept[0] or (w == kept[0] and key < kept[2]):
             index[s] = (w, vec, key)
+    _checkpoint(PHASE_LEFT, left_total, left_total, is_cancelled, progress)
 
     # ------------------------------------------------------------------
     # 步骤 2：右半按重量层枚举，精确查找 sL = target XOR sR，
@@ -261,13 +343,19 @@ def solve(channels, checks) -> SolveResult:
     best_full = -1
     best_key = -1
 
+    right_total = 1 << r
+    right_done = 0
     for wR in range(r + 1):
         # wL 最小为 0；只有 wR 严格大于已知最优总重量时该层才无机会。
         # wR == best_weight 的层仍可能由 wL=0 给出同重量、字典序更小的解。
         if wR > best_weight:
             break
         for vecR in _combinations_by_weight(r, wR):
-            sR = syndrome(vecR, right_masks)
+            if right_done % RIGHT_CHECKPOINT_STEP == 0:
+                _checkpoint(PHASE_RIGHT, right_done, right_total,
+                            is_cancelled, progress)
+            right_done += 1
+            sR = _syndrome(vecR, right_masks)
             need = (target ^ sR) & full_mask
             kept = index.get(need)
             if kept is None:
@@ -286,11 +374,12 @@ def solve(channels, checks) -> SolveResult:
                 if key < best_key:
                     best_full = full
                     best_key = key
+    _checkpoint(PHASE_RIGHT, right_done, right_total, is_cancelled, progress)
 
     if best_full < 0:
         return SolveResult(
             feasible=False,
-            channels=tuple(ordered_channels),
+            channels=frozen.channels,
             faulty=(),
             weight=-1,
             vector=(),
@@ -300,17 +389,22 @@ def solve(channels, checks) -> SolveResult:
 
     vector = tuple((best_full >> j) & 1 for j in range(n))
     faulty = tuple(
-        ordered_channels[j] for j in range(n) if (best_full >> j) & 1
+        frozen.channels[j] for j in range(n) if (best_full >> j) & 1
     )
     return SolveResult(
         feasible=True,
-        channels=tuple(ordered_channels),
+        channels=frozen.channels,
         faulty=faulty,
         weight=best_weight,
         vector=vector,
         left_size=l,
         left_index_size=len(index),
     )
+
+
+def solve(channels, checks, is_cancelled=None, progress=None) -> SolveResult:
+    """校验/冻结输入后求解（测试与简单调用使用的便捷封装）。"""
+    return solve_frozen(prepare(channels, checks), is_cancelled, progress)
 
 
 def recompute(ordered_channels, checks, vector) -> list[dict]:
